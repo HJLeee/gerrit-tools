@@ -4,15 +4,13 @@
 from __future__ import annotations
 
 import argparse
-import configparser
 from dataclasses import dataclass
 from pathlib import Path
-import subprocess
 import shutil
+import subprocess
 import sys
 from typing import Callable, Sequence
 
-CONFIG_PATH = Path.home() / ".gerrit.ini"
 DEFAULT_HOST = "review.tizen.org"
 DEFAULT_PORT = "29418"
 DEFAULT_WORKING_BRANCH = "origin/tizen"
@@ -20,89 +18,71 @@ DEFAULT_WORKING_BRANCH = "origin/tizen"
 
 @dataclass(frozen=True)
 class Profile:
+    """The fixed Gerrit endpoint and default branch used by this tool."""
+
     host: str = DEFAULT_HOST
     port: str = DEFAULT_PORT
-    user: str | None = None
     working_branch: str | None = DEFAULT_WORKING_BRANCH
-
-
-class ConfigurationError(Exception):
-    pass
-
-
-class ConfigStore:
-    """Load optional per-profile overrides for the built-in Gerrit endpoint."""
-
-    def __init__(self, path: Path = CONFIG_PATH) -> None:
-        self.path = path
-
-    def get_profile(self, requested: str | None) -> Profile:
-        if not self.path.exists():
-            if requested:
-                raise ConfigurationError(f"Profile [{requested}] was not found: {self.path} does not exist")
-            return Profile()
-
-        config = configparser.ConfigParser()
-        config.read(self.path)
-        if not config.sections():
-            raise ConfigurationError(f"No profiles found in {self.path}")
-        name = self._select_profile(config, requested)
-        section = config[name]
-        host = self._value(section, "host", DEFAULT_HOST)
-        port = self._value(section, "port", DEFAULT_PORT)
-        user = self._value(section, "user", None)
-        branch = self._value(section, "working_branch", DEFAULT_WORKING_BRANCH)
-        if not host:
-            raise ConfigurationError(f"Profile [{name}] has an empty host")
-        if not port.isdecimal() or not 0 < int(port) < 65536:
-            raise ConfigurationError(f"Profile [{name}] has an invalid port: {port!r}")
-        return Profile(host, port, user or None, branch or None)
-
-    @staticmethod
-    def _value(section: configparser.SectionProxy, key: str, fallback: str | None) -> str | None:
-        return section[key].strip() if key in section else fallback
-
-    def _select_profile(self, config: configparser.ConfigParser, requested: str | None) -> str:
-        if requested:
-            if requested not in config:
-                raise ConfigurationError(f"Profile [{requested}] was not found in {self.path}")
-            return requested
-        profiles = config.sections()
-        if len(profiles) == 1:
-            return profiles[0]
-        raise ConfigurationError(
-            f"Multiple profiles found; use --profile. Available: {', '.join(profiles)}"
-        )
 
 
 class GerritClient:
     """Gerrit and Git process operations used by command handlers."""
 
-    def __init__(self, profile: Profile) -> None:
-        self.profile = profile
+    def __init__(self, profile: Profile | None = None) -> None:
+        self.profile = profile or Profile()
 
     def list_projects(self) -> list[str]:
-        command = ["ssh", "-p", self.profile.port]
-        if self.profile.user:
-            command.extend(["-l", self.profile.user])
-        command.extend([self.profile.host, "gerrit", "ls-projects"])
-        result = subprocess.run(command, check=True, text=True, stdout=subprocess.PIPE)
+        result = subprocess.run(
+            ["ssh", "-p", self.profile.port, self.profile.host, "gerrit", "ls-projects"],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        )
         return result.stdout.splitlines()
+
+    def checkout_branch(self, destination: Path, working_branch: str) -> None:
+        """Fetch one shallow branch into an existing clone and switch to it."""
+        branch = working_branch.removeprefix("origin/")
+        remote_ref = f"refs/heads/{branch}:refs/remotes/origin/{branch}"
+        subprocess.run(["git", "fetch", "--depth", "1", "--no-tags", "origin", remote_ref],
+                       check=True, cwd=destination)
+        local_ref = f"refs/heads/{branch}"
+        exists = subprocess.run(["git", "show-ref", "--verify", "--quiet", local_ref],
+                                check=False, cwd=destination).returncode == 0
+        if exists:
+            subprocess.run(["git", "checkout", branch], check=True, cwd=destination)
+            return
+
+        subprocess.run(["git", "checkout", "-b", branch, f"origin/{branch}"],
+                       check=True, cwd=destination)
+        subprocess.run(["git", "config", f"branch.{branch}.remote", "origin"],
+                       check=True, cwd=destination)
+        subprocess.run(["git", "config", f"branch.{branch}.merge", f"refs/heads/{branch}"],
+                       check=True, cwd=destination)
 
     def clone_project(self, project: str, target: str | None, branch: str | None = None) -> None:
         destination = target or Path(project).name
-        authority = f"{self.profile.user}@" if self.profile.user else ""
-        url = f"ssh://{authority}{self.profile.host}:{self.profile.port}/{project}"
-        clone = ["git", "clone", "--depth", "1"]
+        destination_path = Path(destination)
         working_branch = branch if branch is not None else self.profile.working_branch
+        if destination_path.exists():
+            if not (destination_path / ".git").exists():
+                raise ValueError(f"Destination exists but is not a Git repository: {destination}")
+            if working_branch:
+                self.checkout_branch(destination_path, working_branch)
+            return
+
+        command = ["git", "clone", "--depth", "1"]
         if working_branch:
-            clone.extend(["--branch", working_branch.removeprefix("origin/")])
-        clone.extend([url, destination])
-        subprocess.run(clone, check=True)
+            command.extend(["--branch", working_branch.removeprefix("origin/")])
+        command.extend([f"ssh://{self.profile.host}:{self.profile.port}/{project}", destination])
+        subprocess.run(command, check=True)
+
         try:
-            hook_host = f"{authority}{self.profile.host}"
-            subprocess.run(["scp", "-O", "-p", "-P", self.profile.port,
-                            f"{hook_host}:hooks/commit-msg", f"{destination}/.git/hooks/"], check=True)
+            subprocess.run(
+                ["scp", "-O", "-p", "-P", self.profile.port,
+                 f"{self.profile.host}:hooks/commit-msg", f"{destination}/.git/hooks/"],
+                check=True,
+            )
         except subprocess.CalledProcessError:
             print(f"Clone completed, but Gerrit setup failed in {destination}.", file=sys.stderr)
             raise
@@ -124,7 +104,9 @@ def render_projects(projects: list[str], title: str) -> None:
             subprocess.run(
                 [bat, "--paging=never", "--style=header,grid,numbers",
                  "--file-name", title, "--language=txt"],
-                input=content + ("\n" if content else ""), text=True, check=True,
+                input=content + ("\n" if content else ""),
+                text=True,
+                check=True,
             )
             return
         except (OSError, subprocess.CalledProcessError):
@@ -154,10 +136,14 @@ def command_source(args: argparse.Namespace, client: GerritClient) -> int:
     return 0
 
 
-def add_command(subparsers: argparse._SubParsersAction[argparse.ArgumentParser],
-                name: str, help_text: str, handler: CommandHandler,
-                configure: Callable[[argparse.ArgumentParser], None] | None = None,
-                aliases: tuple[str, ...] = ()) -> None:
+def add_command(
+    subparsers: argparse._SubParsersAction[argparse.ArgumentParser],
+    name: str,
+    help_text: str,
+    handler: CommandHandler,
+    configure: Callable[[argparse.ArgumentParser], None] | None = None,
+    aliases: tuple[str, ...] = (),
+) -> None:
     """Register commands centrally; handlers and client methods stay independent."""
     command = subparsers.add_parser(name, help=help_text, aliases=list(aliases))
     if configure:
@@ -167,7 +153,6 @@ def add_command(subparsers: argparse._SubParsersAction[argparse.ArgumentParser],
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("-p", "-P", "--profile", help="optional profile in ~/.gerrit.ini")
     subparsers = parser.add_subparsers(dest="command", required=True)
     add_command(subparsers, "ls", "show all projects", command_list)
 
@@ -178,7 +163,7 @@ def build_parser() -> argparse.ArgumentParser:
     def source_options(command: argparse.ArgumentParser) -> None:
         command.add_argument("path", help="Gerrit project path")
         command.add_argument("target", nargs="?", help="clone destination")
-        command.add_argument("-b", "--branch", help="branch to shallow-clone; overrides the profile")
+        command.add_argument("-b", "--branch", help="branch to shallow-clone")
     add_command(subparsers, "src", "clone a project and install its Gerrit hook",
                 command_source, source_options, aliases=("clone",))
     return parser
@@ -187,8 +172,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        return args.handler(args, GerritClient(ConfigStore().get_profile(args.profile)))
-    except (ConfigurationError, subprocess.CalledProcessError) as error:
+        return args.handler(args, GerritClient())
+    except (subprocess.CalledProcessError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
 

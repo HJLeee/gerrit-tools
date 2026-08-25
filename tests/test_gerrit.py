@@ -1,5 +1,4 @@
 import argparse
-import configparser
 from io import StringIO
 import importlib.machinery
 import importlib.util
@@ -19,38 +18,6 @@ sys.modules[SPEC.name] = gerrit
 LOADER.exec_module(gerrit)
 
 
-class ConfigStoreTests(unittest.TestCase):
-    def write_config(self, path, sections):
-        config = configparser.ConfigParser()
-        config.read_dict(sections)
-        with path.open("w", encoding="utf-8") as output:
-            config.write(output)
-
-    def test_missing_config_uses_built_in_endpoint(self):
-        with tempfile.TemporaryDirectory() as directory:
-            profile = gerrit.ConfigStore(Path(directory) / ".gerrit.ini").get_profile(None)
-        self.assertEqual(profile, gerrit.Profile("review.tizen.org", "29418", None, "origin/tizen"))
-
-    def test_profile_overrides_only_values_it_contains(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / ".gerrit.ini"
-            self.write_config(path, {"tizen": {"user": "alice", "working_branch": "origin/main"}})
-            profile = gerrit.ConfigStore(path).get_profile(None)
-        self.assertEqual(profile, gerrit.Profile("review.tizen.org", "29418", "alice", "origin/main"))
-
-    def test_requires_profile_when_multiple_exist(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / ".gerrit.ini"
-            self.write_config(path, {"one": {}, "two": {}})
-            with self.assertRaisesRegex(gerrit.ConfigurationError, "use --profile"):
-                gerrit.ConfigStore(path).get_profile(None)
-
-    def test_rejects_unknown_profile(self):
-        with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(gerrit.ConfigurationError, "does not exist"):
-                gerrit.ConfigStore(Path(directory) / ".gerrit.ini").get_profile("tizen")
-
-
 class CommandTests(unittest.TestCase):
     def test_ls_does_not_require_keyword_argument(self):
         client = unittest.mock.Mock()
@@ -68,43 +35,6 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(output.getvalue(), "b/project\n")
 
-    def test_list_projects_omits_user_when_not_configured(self):
-        completed = subprocess.CompletedProcess([], 0, stdout="a\nb\n")
-        with patch.object(gerrit.subprocess, "run", return_value=completed) as run:
-            projects = gerrit.GerritClient(gerrit.Profile()).list_projects()
-        self.assertEqual(projects, ["a", "b"])
-        run.assert_called_once_with(
-            ["ssh", "-p", "29418", "review.tizen.org", "gerrit", "ls-projects"],
-            check=True, text=True, stdout=subprocess.PIPE,
-        )
-
-    def test_list_projects_uses_configured_user(self):
-        profile = gerrit.Profile("review.example.com", "29418", "alice", None)
-        completed = subprocess.CompletedProcess([], 0, stdout="")
-        with patch.object(gerrit.subprocess, "run", return_value=completed) as run:
-            gerrit.GerritClient(profile).list_projects()
-        run.assert_called_once_with(
-            ["ssh", "-p", "29418", "-l", "alice", "review.example.com", "gerrit", "ls-projects"],
-            check=True, text=True, stdout=subprocess.PIPE,
-        )
-
-    def test_source_uses_a_depth_one_clone(self):
-        profile = gerrit.Profile()
-        with patch.object(gerrit.subprocess, "run") as run:
-            gerrit.GerritClient(profile).clone_project("platform/core", None)
-        self.assertEqual(run.call_args_list[0], call(
-            ["git", "clone", "--depth", "1", "--branch", "tizen",
-             "ssh://review.tizen.org:29418/platform/core", "core"], check=True
-        ))
-
-    def test_source_branch_option_overrides_the_profile(self):
-        with patch.object(gerrit.subprocess, "run") as run:
-            gerrit.GerritClient(gerrit.Profile()).clone_project("platform/core", None, "origin/release")
-        self.assertEqual(run.call_args_list[0], call(
-            ["git", "clone", "--depth", "1", "--branch", "release",
-             "ssh://review.tizen.org:29418/platform/core", "core"], check=True
-        ))
-
     def test_interactive_projects_use_batcat_when_available(self):
         output = unittest.mock.Mock()
         output.isatty.return_value = True
@@ -118,7 +48,56 @@ class CommandTests(unittest.TestCase):
             input="a/project\n", text=True, check=True,
         )
 
-    def test_parser_registers_original_commands(self):
+    def test_list_projects_uses_fixed_ssh_endpoint(self):
+        completed = subprocess.CompletedProcess([], 0, stdout="a\nb\n")
+        with patch.object(gerrit.subprocess, "run", return_value=completed) as run:
+            projects = gerrit.GerritClient().list_projects()
+        self.assertEqual(projects, ["a", "b"])
+        run.assert_called_once_with(
+            ["ssh", "-p", "29418", "review.tizen.org", "gerrit", "ls-projects"],
+            check=True, text=True, stdout=subprocess.PIPE,
+        )
+
+    def test_source_uses_a_depth_one_clone_of_tizen(self):
+        with patch.object(gerrit.subprocess, "run") as run:
+            gerrit.GerritClient().clone_project("platform/core", None)
+        self.assertEqual(run.call_args_list[0], call(
+            ["git", "clone", "--depth", "1", "--branch", "tizen",
+             "ssh://review.tizen.org:29418/platform/core", "core"], check=True
+        ))
+        self.assertEqual(run.call_args_list[1], call(
+            ["scp", "-O", "-p", "-P", "29418",
+             "review.tizen.org:hooks/commit-msg", "core/.git/hooks/"], check=True
+        ))
+
+    def test_source_branch_option_overrides_default(self):
+        with patch.object(gerrit.subprocess, "run") as run:
+            gerrit.GerritClient().clone_project("platform/core", None, "origin/release")
+        self.assertEqual(run.call_args_list[0], call(
+            ["git", "clone", "--depth", "1", "--branch", "release",
+             "ssh://review.tizen.org:29418/platform/core", "core"], check=True
+        ))
+
+    def test_existing_clone_fetches_and_checks_out_requested_branch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "core"
+            (destination / ".git").mkdir(parents=True)
+            results = [subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 1),
+                       subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 0),
+                       subprocess.CompletedProcess([], 0)]
+            with patch.object(gerrit.subprocess, "run", side_effect=results) as run:
+                gerrit.GerritClient().clone_project("platform/core", str(destination), "release")
+        self.assertEqual(run.call_args_list, [
+            call(["git", "fetch", "--depth", "1", "--no-tags", "origin",
+                  "refs/heads/release:refs/remotes/origin/release"], check=True, cwd=destination),
+            call(["git", "show-ref", "--verify", "--quiet", "refs/heads/release"],
+                 check=False, cwd=destination),
+            call(["git", "checkout", "-b", "release", "origin/release"], check=True, cwd=destination),
+            call(["git", "config", "branch.release.remote", "origin"], check=True, cwd=destination),
+            call(["git", "config", "branch.release.merge", "refs/heads/release"], check=True, cwd=destination),
+        ])
+
+    def test_parser_registers_commands_and_alias(self):
         parser = gerrit.build_parser()
         self.assertEqual(parser.parse_args(["ls"]).handler, gerrit.command_list)
         self.assertEqual(parser.parse_args(["search", "foo"]).handler, gerrit.command_list)

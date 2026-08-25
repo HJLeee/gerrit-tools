@@ -1,36 +1,20 @@
 # gerrit-tools
 
-Small command-line helpers for browsing and cloning Gerrit projects.
+Small command-line helpers for browsing and cloning projects from the Tizen
+Gerrit server at `review.tizen.org:29418`. No configuration file is used.
+SSH selects the account and authentication through its normal configuration.
 
 ## Commands
 
 - `gerrit ls` — list visible Gerrit projects.
 - `gerrit search <keyword>` — list projects whose names contain `keyword`.
-- `gerrit src <project> [target] [-b <branch>]` (also available as `gerrit clone`) — clone a project, optionally check out its
-  configured tracking branch, and install Gerrit's `commit-msg` hook.
+- `gerrit src <project> [target] [-b <branch>]` — shallow-clone a project,
+  install Gerrit's `commit-msg` hook, and check out `tizen` by default.
+  `gerrit clone` is an alias.
 
-Use `-p` / `--profile` to select optional overrides. In an interactive terminal,
-project lists are rendered with `batcat` (or `bat`) when available; piped output
-remains one project path per line.
-
-## Configuration
-
-No configuration file is required: the built-in endpoint is
-`review.tizen.org:29418`. In the absence of `~/.gerrit.ini`, SSH chooses the
-user from its normal configuration or the current OS user, and `src` checks out `origin/tizen` by default. The configured branch is fetched
-with clone, so it remains shallow. Use `src -b <branch>` to override it for one clone.
-
-If `~/.gerrit.ini` exists, its selected profile overrides only the keys it
-contains. `user` is optional. `working_branch` overrides the default; set it to an empty value
-to skip the branch checkout.
-
-```ini
-[tizen]
-host = other-review.example.com
-port = 29418
-user = alice
-working_branch = origin/main
-```
-
-With multiple profiles, `--profile` is required. An explicitly selected profile
-also requires that the configuration file exists.
+Use `-b` / `--branch` to choose a branch for one clone. If its destination
+already exists as a Git repository, the command shallow-fetches it without tags, creates a local branch, and explicitly sets its
+upstream before checkout; this works with single-branch shallow clones too. Both `tizen` and
+`origin/tizen` forms are accepted. In an interactive terminal, project lists
+are rendered with `batcat` (or `bat`) when available; piped output remains one
+project path per line.
