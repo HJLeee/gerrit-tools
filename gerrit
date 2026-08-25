@@ -1,104 +1,197 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
+"""Gerrit Tools - search and clone Gerrit projects."""
 
-"""Gerrit Tools - commandline tool for searching, checking out gerrit repositories."""
+from __future__ import annotations
 
-import sys
-import os
 import argparse
 import configparser
+from dataclasses import dataclass
+from pathlib import Path
 import subprocess
+import shutil
+import sys
+from typing import Callable, Sequence
 
-_CONFIG = None
-_CONFIG_PATH = ['$HOME/.gerrit-tools', '/etc/gerrit-tools', '$PWD']
-_CONFIG_FILE = 'config.ini'
-
-def get_config(profile):
-    global _CONFIG
-
-    if _CONFIG is None:
-        # Find Config File
-        configPath = None
-        for i,p in enumerate(_CONFIG_PATH):
-            p = p.replace('$HOME', os.environ['HOME'])
-            p = p.replace('$PWD', os.environ['PWD'])
-            _CONFIG_PATH[i] = p
-            if os.path.isfile(p + os.sep + _CONFIG_FILE):
-                configPath = p + os.sep + _CONFIG_FILE
-                break
-        if configPath is None:
-            #print("Can't find %s in %s" % (_CONFIG_FILE, _CONFIG_PATH))
-            config = dict(gerrit_port = "29418", gerrit_host = "review.tizen.org", gerrit_user = "leee", gerrit_working_branch = "origin/tizen")
-            return config
-
-        # Open Config File
-        _CONFIG = configparser.ConfigParser()
-        _CONFIG.read(configPath)
-
-    if profile is None:
-        sections = _CONFIG.sections()
-        if len(sections) > 0:
-            profile = sections[0]
-
-    return _CONFIG._sections[profile]
+CONFIG_PATH = Path.home() / ".gerrit.ini"
+DEFAULT_HOST = "review.tizen.org"
+DEFAULT_PORT = "29418"
+DEFAULT_WORKING_BRANCH = "origin/tizen"
 
 
-def cmd_list(args):
-    config = get_config(args.profile)
-
-    p = subprocess.Popen(['ssh', '-p', config['gerrit_port'], config['gerrit_host'],
-                            '-l', config['gerrit_user'], 'gerrit', 'ls-projects'],
-                            stdout=subprocess.PIPE)
-    for line in p.stdout.readlines():
-        if hasattr(args, 'keyword'):
-            if line.find(args.keyword.encode()) > -1:
-                print(line.decode().strip())
-        else:
-            print(line.strip())
+@dataclass(frozen=True)
+class Profile:
+    host: str = DEFAULT_HOST
+    port: str = DEFAULT_PORT
+    user: str | None = None
+    working_branch: str | None = DEFAULT_WORKING_BRANCH
 
 
-def cmd_source(args):
-    config = get_config(args.profile)
+class ConfigurationError(Exception):
+    pass
 
-    url = 'ssh://' + config['gerrit_user'] + '@' + config['gerrit_host'] + ':' + config['gerrit_port'] + '/' + args.path
 
-    if args.target is None:
-        created_dir = os.path.basename(args.path)
+class ConfigStore:
+    """Load optional per-profile overrides for the built-in Gerrit endpoint."""
+
+    def __init__(self, path: Path = CONFIG_PATH) -> None:
+        self.path = path
+
+    def get_profile(self, requested: str | None) -> Profile:
+        if not self.path.exists():
+            if requested:
+                raise ConfigurationError(f"Profile [{requested}] was not found: {self.path} does not exist")
+            return Profile()
+
+        config = configparser.ConfigParser()
+        config.read(self.path)
+        if not config.sections():
+            raise ConfigurationError(f"No profiles found in {self.path}")
+        name = self._select_profile(config, requested)
+        section = config[name]
+        host = self._value(section, "host", DEFAULT_HOST)
+        port = self._value(section, "port", DEFAULT_PORT)
+        user = self._value(section, "user", None)
+        branch = self._value(section, "working_branch", DEFAULT_WORKING_BRANCH)
+        if not host:
+            raise ConfigurationError(f"Profile [{name}] has an empty host")
+        if not port.isdecimal() or not 0 < int(port) < 65536:
+            raise ConfigurationError(f"Profile [{name}] has an invalid port: {port!r}")
+        return Profile(host, port, user or None, branch or None)
+
+    @staticmethod
+    def _value(section: configparser.SectionProxy, key: str, fallback: str | None) -> str | None:
+        return section[key].strip() if key in section else fallback
+
+    def _select_profile(self, config: configparser.ConfigParser, requested: str | None) -> str:
+        if requested:
+            if requested not in config:
+                raise ConfigurationError(f"Profile [{requested}] was not found in {self.path}")
+            return requested
+        profiles = config.sections()
+        if len(profiles) == 1:
+            return profiles[0]
+        raise ConfigurationError(
+            f"Multiple profiles found; use --profile. Available: {', '.join(profiles)}"
+        )
+
+
+class GerritClient:
+    """Gerrit and Git process operations used by command handlers."""
+
+    def __init__(self, profile: Profile) -> None:
+        self.profile = profile
+
+    def list_projects(self) -> list[str]:
+        command = ["ssh", "-p", self.profile.port]
+        if self.profile.user:
+            command.extend(["-l", self.profile.user])
+        command.extend([self.profile.host, "gerrit", "ls-projects"])
+        result = subprocess.run(command, check=True, text=True, stdout=subprocess.PIPE)
+        return result.stdout.splitlines()
+
+    def clone_project(self, project: str, target: str | None, branch: str | None = None) -> None:
+        destination = target or Path(project).name
+        authority = f"{self.profile.user}@" if self.profile.user else ""
+        url = f"ssh://{authority}{self.profile.host}:{self.profile.port}/{project}"
+        clone = ["git", "clone", "--depth", "1"]
+        working_branch = branch if branch is not None else self.profile.working_branch
+        if working_branch:
+            clone.extend(["--branch", working_branch.removeprefix("origin/")])
+        clone.extend([url, destination])
+        subprocess.run(clone, check=True)
+        try:
+            hook_host = f"{authority}{self.profile.host}"
+            subprocess.run(["scp", "-O", "-p", "-P", self.profile.port,
+                            f"{hook_host}:hooks/commit-msg", f"{destination}/.git/hooks/"], check=True)
+        except subprocess.CalledProcessError:
+            print(f"Clone completed, but Gerrit setup failed in {destination}.", file=sys.stderr)
+            raise
+
+
+CommandHandler = Callable[[argparse.Namespace, GerritClient], int]
+
+
+def render_projects(projects: list[str], title: str) -> None:
+    """Use bat when interactive, without changing piped machine-readable output."""
+    content = "\n".join(projects)
+    if not sys.stdout.isatty():
+        print(content)
+        return
+
+    bat = shutil.which("batcat") or shutil.which("bat")
+    if bat:
+        try:
+            subprocess.run(
+                [bat, "--paging=never", "--style=header,grid,numbers",
+                 "--file-name", title, "--language=txt"],
+                input=content + ("\n" if content else ""), text=True, check=True,
+            )
+            return
+        except (OSError, subprocess.CalledProcessError):
+            pass
+
+    print(title)
+    print("─" * len(title))
+    if projects:
+        for number, project in enumerate(projects, start=1):
+            print(f"{number:>4}  {project}")
     else:
-        created_dir = args.target
+        print("No projects found.")
 
-    ret = subprocess.call(['git', 'clone', url, created_dir])
 
-    if ret == 0 and config['gerrit_working_branch'] is not None:
-        curr_path = os.getcwd()
-        os.chdir(created_dir)
-        branch_name = config['gerrit_working_branch']
-        ret = subprocess.call(['git', 'checkout', '-t', branch_name])
-        os.chdir(curr_path)
+def command_list(args: argparse.Namespace, client: GerritClient) -> int:
+    projects = client.list_projects()
+    keyword = getattr(args, "keyword", None)
+    if keyword:
+        projects = [project for project in projects if keyword in project]
+    title = "Gerrit projects" if not keyword else f"Gerrit projects matching: {keyword}"
+    render_projects(projects, title)
+    return 0
 
-    if ret == 0:
-        url = config['gerrit_user'] + '@' + config['gerrit_host'] + ':hooks/commit-msg'
-        subprocess.call(['scp', '-p', '-P', config['gerrit_port'], url, created_dir + '/.git/hooks/'])
+
+def command_source(args: argparse.Namespace, client: GerritClient) -> int:
+    client.clone_project(args.path, args.target, args.branch)
+    return 0
+
+
+def add_command(subparsers: argparse._SubParsersAction[argparse.ArgumentParser],
+                name: str, help_text: str, handler: CommandHandler,
+                configure: Callable[[argparse.ArgumentParser], None] | None = None,
+                aliases: tuple[str, ...] = ()) -> None:
+    """Register commands centrally; handlers and client methods stay independent."""
+    command = subparsers.add_parser(name, help=help_text, aliases=list(aliases))
+    if configure:
+        configure(command)
+    command.set_defaults(handler=handler)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-p", "-P", "--profile", help="optional profile in ~/.gerrit.ini")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    add_command(subparsers, "ls", "show all projects", command_list)
+
+    def search_options(command: argparse.ArgumentParser) -> None:
+        command.add_argument("keyword", help="case-sensitive project name fragment")
+    add_command(subparsers, "search", "search projects", command_list, search_options)
+
+    def source_options(command: argparse.ArgumentParser) -> None:
+        command.add_argument("path", help="Gerrit project path")
+        command.add_argument("target", nargs="?", help="clone destination")
+        command.add_argument("-b", "--branch", help="branch to shallow-clone; overrides the profile")
+    add_command(subparsers, "src", "clone a project and install its Gerrit hook",
+                command_source, source_options, aliases=("clone",))
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return args.handler(args, GerritClient(ConfigStore().get_profile(args.profile)))
+    except (ConfigurationError, subprocess.CalledProcessError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('-p', '-P', '--profile', help='set a profile in config.ini.')
-
-    subparsers = parser.add_subparsers()
-
-    # ls
-    parser_list = subparsers.add_parser('ls', help='show list of packages')
-    parser_list.set_defaults(func=cmd_list)
-
-    # src|source {path}
-    parser_source = subparsers.add_parser('src', help='checkout a package')
-    parser_source.add_argument('path')
-    parser_source.add_argument('target', nargs='?', default=None)
-    parser_source.set_defaults(func=cmd_source)
-
-    # search {keyword}
-    parser_search = subparsers.add_parser('search', help='search packages')
-    parser_search.add_argument('keyword')
-    parser_search.set_defaults(func=cmd_list)
-
-    args = parser.parse_args()
-    args.func(args)
+    raise SystemExit(main())
