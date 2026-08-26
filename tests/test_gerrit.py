@@ -106,6 +106,86 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(source_args.branch, "release")
         self.assertEqual(parser.parse_args(["clone", "platform/core"]).handler, gerrit.command_source)
 
+    def test_select_project_skips_the_picker_for_a_single_match(self):
+        with patch.object(gerrit.subprocess, "run") as run:
+            chosen = gerrit.select_project(["only/one"], "Gerrit projects")
+        self.assertEqual(chosen, "only/one")
+        run.assert_not_called()
+
+    def test_select_project_uses_fzf_when_available(self):
+        stdout = unittest.mock.Mock()
+        stdout.isatty.return_value = True
+        completed = subprocess.CompletedProcess([], 0, stdout="b/project\n")
+        with patch.object(gerrit.sys, "stdout", stdout), \
+             patch.object(gerrit.shutil, "which", return_value="/usr/bin/fzf"), \
+             patch.object(gerrit.subprocess, "run", return_value=completed) as run:
+            chosen = gerrit.select_project(["a/project", "b/project"], "Gerrit projects")
+        self.assertEqual(chosen, "b/project")
+        run.assert_called_once_with(
+            ["/usr/bin/fzf", "--height=40%", "--reverse", "--prompt", "project> ",
+             "--header", "Gerrit projects"],
+            input="a/project\nb/project", text=True, stdout=subprocess.PIPE, check=False,
+        )
+
+    def test_select_project_treats_a_cancelled_picker_as_no_choice(self):
+        stdout = unittest.mock.Mock()
+        stdout.isatty.return_value = True
+        completed = subprocess.CompletedProcess([], 130, stdout="")
+        with patch.object(gerrit.sys, "stdout", stdout), \
+             patch.object(gerrit.shutil, "which", return_value="/usr/bin/fzf"), \
+             patch.object(gerrit.subprocess, "run", return_value=completed):
+            chosen = gerrit.select_project(["a/project", "b/project"], "Gerrit projects")
+        self.assertIsNone(chosen)
+
+    def test_select_project_falls_back_to_a_numbered_prompt(self):
+        stdout = unittest.mock.Mock()
+        stdout.isatty.return_value = True
+        with patch.object(gerrit.sys, "stdout", stdout), \
+             patch.object(gerrit.shutil, "which", return_value=None), \
+             patch.object(gerrit, "render_projects"), \
+             patch("builtins.input", return_value="2"), \
+             patch("sys.stderr", new_callable=StringIO):
+            chosen = gerrit.select_project(["a/project", "b/project"], "Gerrit projects")
+        self.assertEqual(chosen, "b/project")
+
+    def test_pick_clones_the_selected_project(self):
+        client = unittest.mock.Mock()
+        client.list_projects.return_value = ["a/project", "b/project"]
+        args = argparse.Namespace(keyword="project", target="dest", branch="release")
+        with patch.object(gerrit, "select_project", return_value="b/project") as select, \
+             patch("sys.stderr", new_callable=StringIO):
+            result = gerrit.command_pick(args, client)
+        self.assertEqual(result, 0)
+        select.assert_called_once_with(["a/project", "b/project"],
+                                       "Gerrit projects matching: project")
+        client.clone_project.assert_called_once_with("b/project", "dest", "release")
+
+    def test_pick_does_not_clone_when_the_selection_is_cancelled(self):
+        client = unittest.mock.Mock()
+        client.list_projects.return_value = ["a/project", "b/project"]
+        args = argparse.Namespace(keyword="project", target=None, branch=None)
+        with patch.object(gerrit, "select_project", return_value=None):
+            result = gerrit.command_pick(args, client)
+        self.assertEqual(result, 0)
+        client.clone_project.assert_not_called()
+
+    def test_pick_reports_when_no_project_matches(self):
+        client = unittest.mock.Mock()
+        client.list_projects.return_value = ["a/project"]
+        args = argparse.Namespace(keyword="missing", target=None, branch=None)
+        with patch("sys.stderr", new_callable=StringIO) as errors:
+            result = gerrit.command_pick(args, client)
+        self.assertEqual(result, 1)
+        self.assertIn("no project matches: missing", errors.getvalue())
+        client.clone_project.assert_not_called()
+
+    def test_parser_registers_pick_with_clone_options(self):
+        parser = gerrit.build_parser()
+        args = parser.parse_args(["pick", "dotnet", "mydir", "-b", "tizen_10.1"])
+        self.assertEqual(args.handler, gerrit.command_pick)
+        self.assertEqual((args.keyword, args.target, args.branch),
+                         ("dotnet", "mydir", "tizen_10.1"))
+
 
 if __name__ == "__main__":
     unittest.main()

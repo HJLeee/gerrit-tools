@@ -121,13 +121,75 @@ def render_projects(projects: list[str], title: str) -> None:
         print("No projects found.")
 
 
-def command_list(args: argparse.Namespace, client: GerritClient) -> int:
-    projects = client.list_projects()
-    keyword = getattr(args, "keyword", None)
-    if keyword:
-        projects = [project for project in projects if keyword in project]
-    title = "Gerrit projects" if not keyword else f"Gerrit projects matching: {keyword}"
+def filter_projects(projects: list[str], keyword: str | None) -> list[str]:
+    """Case-sensitive fragment matching, shared by the list and pick commands."""
+    if not keyword:
+        return projects
+    return [project for project in projects if keyword in project]
+
+
+def projects_title(keyword: str | None) -> str:
+    return f"Gerrit projects matching: {keyword}" if keyword else "Gerrit projects"
+
+
+def prompt_for_project(projects: list[str], title: str) -> str | None:
+    """Numbered fallback for hosts without fzf; the prompt goes to stderr."""
     render_projects(projects, title)
+    print(f"select 1-{len(projects)} (empty to cancel): ", end="", file=sys.stderr, flush=True)
+    try:
+        answer = input().strip()
+    except EOFError:
+        return None
+    if not answer:
+        return None
+    if not answer.isdigit() or not 1 <= int(answer) <= len(projects):
+        raise ValueError(f"invalid selection: {answer}")
+    return projects[int(answer) - 1]
+
+
+def select_project(projects: list[str], title: str) -> str | None:
+    """Choose one project, or None when the user cancels."""
+    if not projects:
+        return None
+    if len(projects) == 1:
+        return projects[0]
+    if not (sys.stdin.isatty() or sys.stdout.isatty()):
+        raise ValueError("selecting a project requires an interactive terminal")
+
+    fzf = shutil.which("fzf")
+    if not fzf:
+        return prompt_for_project(projects, title)
+
+    # fzf reads the list from stdin and keys from /dev/tty, so piping the list is safe.
+    result = subprocess.run(
+        [fzf, "--height=40%", "--reverse", "--prompt", "project> ", "--header", title],
+        input="\n".join(projects),
+        text=True,
+        stdout=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:  # 130 is cancel, 1 is no match; neither is an error here.
+        return None
+    return result.stdout.strip() or None
+
+
+def command_list(args: argparse.Namespace, client: GerritClient) -> int:
+    keyword = getattr(args, "keyword", None)
+    projects = filter_projects(client.list_projects(), keyword)
+    render_projects(projects, projects_title(keyword))
+    return 0
+
+
+def command_pick(args: argparse.Namespace, client: GerritClient) -> int:
+    projects = filter_projects(client.list_projects(), args.keyword)
+    if not projects:
+        print(f"error: no project matches: {args.keyword}", file=sys.stderr)
+        return 1
+    project = select_project(projects, projects_title(args.keyword))
+    if project is None:
+        return 0
+    print(f"selected: {project}", file=sys.stderr)
+    client.clone_project(project, args.target, args.branch)
     return 0
 
 
@@ -156,16 +218,26 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     add_command(subparsers, "ls", "show all projects", command_list)
 
-    def search_options(command: argparse.ArgumentParser) -> None:
+    def add_keyword(command: argparse.ArgumentParser) -> None:
         command.add_argument("keyword", help="case-sensitive project name fragment")
-    add_command(subparsers, "search", "search projects", command_list, search_options)
+
+    def add_clone_options(command: argparse.ArgumentParser) -> None:
+        command.add_argument("target", nargs="?", help="clone destination")
+        command.add_argument("-b", "--branch", help="branch to shallow-clone")
+
+    add_command(subparsers, "search", "search projects", command_list, add_keyword)
 
     def source_options(command: argparse.ArgumentParser) -> None:
         command.add_argument("path", help="Gerrit project path")
-        command.add_argument("target", nargs="?", help="clone destination")
-        command.add_argument("-b", "--branch", help="branch to shallow-clone")
+        add_clone_options(command)
     add_command(subparsers, "src", "clone a project and install its Gerrit hook",
                 command_source, source_options, aliases=("clone",))
+
+    def pick_options(command: argparse.ArgumentParser) -> None:
+        add_keyword(command)
+        add_clone_options(command)
+    add_command(subparsers, "pick", "search, choose one project, and clone it",
+                command_pick, pick_options)
     return parser
 
 

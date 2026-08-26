@@ -11,6 +11,12 @@ SSH selects the account and authentication through its normal configuration.
 - `gerrit src <project> [target] [-b <branch>]` — shallow-clone a project,
   install Gerrit's `commit-msg` hook, and check out `tizen` by default.
   `gerrit clone` is an alias.
+- `gerrit pick <keyword> [target] [-b <branch>]` — search, choose one of the
+  matches interactively, and clone it.
+
+`pick` hands the matches to `fzf` when it is installed and falls back to a
+numbered prompt otherwise. A single match is cloned without asking, and
+cancelling the picker exits without cloning anything.
 
 Use `-b` / `--branch` to choose a branch for one clone. If its destination
 already exists as a Git repository, the command shallow-fetches it without tags, creates a local branch, and explicitly sets its
